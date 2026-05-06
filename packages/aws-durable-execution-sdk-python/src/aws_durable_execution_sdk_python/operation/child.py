@@ -15,6 +15,7 @@ from aws_durable_execution_sdk_python.lambda_service import (
     ErrorObject,
     OperationSubType,
     OperationUpdate,
+    OperationType,
 )
 from aws_durable_execution_sdk_python.operation.base import (
     CheckResult,
@@ -154,6 +155,13 @@ class ChildOperationExecutor(OperationExecutor[T]):
             self.operation_identifier.operation_id,
             self.operation_identifier.name,
         )
+        # todo: fix is_replay
+        start_info = self.state.on_user_function_start(
+            self.operation_identifier,
+            OperationType.CONTEXT,
+            self.sub_type,
+            is_replay=True,
+        )
 
         try:
             raw_result: T = self.func()
@@ -223,6 +231,7 @@ class ChildOperationExecutor(OperationExecutor[T]):
             # Must ensure the child context result is persisted before returning to the parent.
             # This guarantees the result is durable and child operations won't be re-executed on replay
             # (unless replay_children=True for large payloads).
+            self.state.on_user_function_end(start_info)
             self.state.create_checkpoint(operation_update=success_operation)
 
             logger.debug(
@@ -246,6 +255,7 @@ class ChildOperationExecutor(OperationExecutor[T]):
                 # Checkpoint child context FAIL with blocking (is_sync=True, default).
                 # Must ensure the failure state is persisted before raising the exception.
                 # This guarantees the error is durable and child operations won't be re-executed on replay.
+                self.state.on_user_function_end(start_info, error_object)
                 self.state.create_checkpoint(operation_update=fail_operation)
 
             # InvocationError and its derivatives can be retried.

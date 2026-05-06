@@ -11,6 +11,8 @@ from aws_durable_execution_sdk_python.exceptions import (
 from aws_durable_execution_sdk_python.lambda_service import (
     ErrorObject,
     OperationUpdate,
+    OperationType,
+    OperationSubType,
 )
 from aws_durable_execution_sdk_python.logger import LogInfo
 from aws_durable_execution_sdk_python.operation.base import (
@@ -176,6 +178,13 @@ class WaitForConditionOperationExecutor(OperationExecutor[T]):
         if checkpointed_result.operation and checkpointed_result.operation.step_details:
             attempt = checkpointed_result.operation.step_details.attempt + 1
 
+        start_info = self.state.on_user_function_start(
+            self.operation_identifier,
+            OperationType.STEP,
+            OperationSubType.WAIT_FOR_CONDITION,
+            False,
+            attempt,
+        )
         try:
             # Execute the check function with the injected logger
             check_context = WaitForConditionCheckContext(
@@ -218,6 +227,7 @@ class WaitForConditionOperationExecutor(OperationExecutor[T]):
                 # Checkpoint SUCCEED operation with blocking (is_sync=True, default).
                 # Must ensure the final state is persisted before returning to the caller.
                 # This guarantees the condition result is durable and won't be re-evaluated on replay.
+                self.state.on_user_function_end(start_info)
                 self.state.create_checkpoint(operation_update=success_operation)
 
                 logger.debug(
@@ -251,6 +261,7 @@ class WaitForConditionOperationExecutor(OperationExecutor[T]):
             # Checkpoint RETRY operation with blocking (is_sync=True, default).
             # Must ensure the current state and next attempt timestamp are persisted before suspending.
             # This guarantees the polling state is durable and will resume correctly on the next invocation.
+            self.state.on_user_function_end(start_info)  # no ErrorObject
             self.state.create_checkpoint(operation_update=retry_operation)
 
             suspend_with_optional_resume_delay(
@@ -274,6 +285,7 @@ class WaitForConditionOperationExecutor(OperationExecutor[T]):
             # Checkpoint FAIL operation with blocking (is_sync=True, default).
             # Must ensure the failure state is persisted before raising the exception.
             # This guarantees the error is durable and the condition won't be re-evaluated on replay.
+            self.state.on_user_function_end(start_info, ErrorObject.from_exception(e))
             self.state.create_checkpoint(operation_update=fail_operation)
             raise
 

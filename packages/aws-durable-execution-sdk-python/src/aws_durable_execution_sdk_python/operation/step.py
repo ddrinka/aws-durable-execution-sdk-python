@@ -17,12 +17,14 @@ from aws_durable_execution_sdk_python.exceptions import (
 from aws_durable_execution_sdk_python.lambda_service import (
     ErrorObject,
     OperationUpdate,
+    OperationType,
 )
 from aws_durable_execution_sdk_python.logger import Logger, LogInfo
 from aws_durable_execution_sdk_python.operation.base import (
     CheckResult,
     OperationExecutor,
 )
+from aws_durable_execution_sdk_python.plugin import UserFunctionStartInfo
 from aws_durable_execution_sdk_python.retries import RetryDecision, RetryPresets
 from aws_durable_execution_sdk_python.serdes import deserialize, serialize
 from aws_durable_execution_sdk_python.suspend import (
@@ -142,7 +144,7 @@ class StepOperationExecutor(OperationExecutor[T]):
         ):
             # Step was previously interrupted in a prior invocation - handle retry
             msg: str = f"Step operation_id={self.operation_identifier.operation_id} name={self.operation_identifier.name} was previously interrupted"
-            self.retry_handler(StepInterruptedError(msg), checkpointed_result)
+            self.retry_handler(StepInterruptedError(msg), checkpointed_result, None)
             checkpointed_result.raise_callable_error()
 
         # Ready to execute if STARTED + AT_LEAST_ONCE
@@ -217,6 +219,10 @@ class StepOperationExecutor(OperationExecutor[T]):
             )
         )
 
+        start_info = self.state.on_user_function_start(
+            self.operation_identifier, OperationType.STEP, None, False, attempt
+        )
+
         try:
             # This is the actual code provided by the caller to execute durably inside the step
             raw_result: T = self.func(step_context)
@@ -235,6 +241,7 @@ class StepOperationExecutor(OperationExecutor[T]):
             # Checkpoint SUCCEED operation with blocking (is_sync=True, default).
             # Must ensure the success state is persisted before returning the result to the caller.
             # This guarantees the step result is durable and won't be lost if Lambda terminates.
+            self.state.on_user_function_end(start_info)
             self.state.create_checkpoint(operation_update=success_operation)
 
             logger.debug(
@@ -260,7 +267,7 @@ class StepOperationExecutor(OperationExecutor[T]):
                 self.operation_identifier.name,
             )
 
-            self.retry_handler(e, checkpointed_result)
+            self.retry_handler(e, checkpointed_result, start_info)
             # If we've failed to raise an exception from the retry_handler, then we are in a
             # weird state, and should crash terminate the execution
             msg = "retry handler should have raised an exception, but did not."
@@ -270,12 +277,14 @@ class StepOperationExecutor(OperationExecutor[T]):
         self,
         error: Exception,
         checkpointed_result: CheckpointedResult,
+        start_info: UserFunctionStartInfo | None,
     ):
         """Checkpoint and suspend for replay if retry required, otherwise raise error.
 
         Args:
             error: The exception that occurred during step execution
             checkpointed_result: The checkpoint data containing operation state
+            start_info: Information about the user function start
 
         Raises:
             SuspendExecution: If retry is scheduled
@@ -333,6 +342,8 @@ class StepOperationExecutor(OperationExecutor[T]):
             # Checkpoint RETRY operation with blocking (is_sync=True, default).
             # Must ensure retry state is persisted before suspending execution.
             # This guarantees the retry attempt count and next attempt timestamp are durable.
+            if start_info:
+                self.state.on_user_function_end(start_info, error_object)
             self.state.create_checkpoint(operation_update=retry_operation)
 
             suspend_with_optional_resume_delay(
@@ -351,6 +362,8 @@ class StepOperationExecutor(OperationExecutor[T]):
         # Checkpoint FAIL operation with blocking (is_sync=True, default).
         # Must ensure the failure state is persisted before raising the exception.
         # This guarantees the error is durable and the step won't be retried on replay.
+        if start_info:
+            self.state.on_user_function_end(start_info, error_object)
         self.state.create_checkpoint(operation_update=fail_operation)
 
         if isinstance(error, StepInterruptedError):
