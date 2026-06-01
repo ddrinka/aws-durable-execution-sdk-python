@@ -17,6 +17,7 @@ from aws_durable_execution_sdk_python.exceptions import (
     CallableRuntimeError,
     DurableExecutionsError,
     GetExecutionStateError,
+    InvocationError,
     OrphanedChildException,
 )
 from aws_durable_execution_sdk_python.lambda_service import (
@@ -37,6 +38,13 @@ if TYPE_CHECKING:
     from collections.abc import MutableMapping
 
 logger = logging.getLogger(__name__)
+
+# Interval at which a synchronous checkpoint waiter re-checks whether the
+# background checkpoint thread is still alive. Bounding the wait lets us detect
+# a background thread that exited without signaling this waiter (a lost-signal
+# wedge) and fail fast for a Lambda retry, instead of blocking until the Lambda
+# timeout (~15 min).
+_SYNC_CHECKPOINT_POLL_SECONDS: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -256,6 +264,10 @@ class ExecutionState:
         self._overflow_queue: queue.Queue[QueuedOperation] = queue.Queue()
         self._checkpointing_stopped: threading.Event = threading.Event()
         self._checkpointing_failed: CompletionEvent = CompletionEvent()
+        # Set when the background checkpoint thread exits for any reason. A
+        # synchronous waiter uses this to detect a thread that died without
+        # signaling its completion event.
+        self._checkpoint_thread_exited: threading.Event = threading.Event()
 
         # Concurrency management for parallel operations: parent_id -> {child_operation_ids}
         self._parent_to_children: dict[str, set[str]] = {}
@@ -548,8 +560,53 @@ class ExecutionState:
                 msg: str = "completion_event must be set for synchronous execution"
                 raise DurableExecutionsError(msg)
 
-            # Wait for completion - will raise BackgroundThreadError if background thread fails
-            completion_event.wait()
+            # Wait for completion. Poll on a bounded interval instead of blocking
+            # indefinitely: if the background checkpoint thread dies without
+            # signaling this waiter (a lost-signal wedge), an unbounded wait
+            # would hang until the Lambda timeout (~15 min). On each tick we
+            # re-check whether the background thread failed or exited.
+            #
+            # completion_event.wait() returns True when signaled (and raises
+            # BackgroundThreadError if the thread set an error), or False on
+            # timeout.
+            wait_start = time.monotonic()
+            while not completion_event.wait(_SYNC_CHECKPOINT_POLL_SECONDS):
+                # Not yet signaled. If the background thread recorded a failure,
+                # surface it (raises the stored BackgroundThreadError).
+                if self._checkpointing_failed.is_set():
+                    self._checkpointing_failed.wait()
+
+                # If the background thread has exited but neither signaled our
+                # completion event nor recorded a failure, it will never wake us.
+                # Fail fast with a retryable error so Lambda retries and the
+                # execution replays from the last durable checkpoint.
+                if self._checkpoint_thread_exited.is_set():
+                    op_id = (
+                        operation_update.operation_id
+                        if operation_update is not None
+                        else "<empty>"
+                    )
+                    elapsed = time.monotonic() - wait_start
+                    logger.error(
+                        "Synchronous checkpoint wedged: background checkpoint "
+                        "thread exited without signaling its waiter. Failing the "
+                        "invocation for retry instead of blocking until the Lambda "
+                        "timeout. operation_id=%s waited_s=%.3f "
+                        "checkpoint_queue_size=%d overflow_queue_size=%d "
+                        "checkpointing_failed=%s checkpointing_stopped=%s",
+                        op_id,
+                        elapsed,
+                        self._checkpoint_queue.qsize(),
+                        self._overflow_queue.qsize(),
+                        self._checkpointing_failed.is_set(),
+                        self._checkpointing_stopped.is_set(),
+                    )
+                    wedge_msg = (
+                        "Background checkpoint thread exited without signaling a "
+                        f"synchronous checkpoint waiter (operation_id={op_id}, "
+                        f"waited_s={elapsed:.3f}); failing invocation for retry."
+                    )
+                    raise InvocationError(wedge_msg)
         else:
             logger.debug("Enqueued checkpoint operation for asynchronous processing")
 
@@ -652,92 +709,101 @@ class ExecutionState:
         # Keep checkpoint token as local variable in the loop
         current_checkpoint_token: str = self._current_checkpoint_token
 
-        while not self._checkpointing_stopped.is_set():
-            # Collect operations into a batch
-            batch: list[QueuedOperation] = self._collect_checkpoint_batch()
+        try:
+            while not self._checkpointing_stopped.is_set():
+                # Collect operations into a batch
+                batch: list[QueuedOperation] = self._collect_checkpoint_batch()
 
-            if batch:
-                # Extract OperationUpdates, excluding empty checkpoints from API call
-                updates: list[OperationUpdate] = []
-                empty_count = 0
+                if batch:
+                    # Extract OperationUpdates, excluding empty checkpoints from API call
+                    updates: list[OperationUpdate] = []
+                    empty_count = 0
 
-                for q in batch:
-                    if q.operation_update is not None:
-                        updates.append(q.operation_update)
-                    else:
-                        empty_count += 1
+                    for q in batch:
+                        if q.operation_update is not None:
+                            updates.append(q.operation_update)
+                        else:
+                            empty_count += 1
 
-                logger.debug(
-                    "Sending %d OperationUpdates out of %d operations, excluding %d empty checkpoints",
-                    len(updates),
-                    len(batch),
-                    empty_count,
-                )
-
-                try:
-                    # Make API call with batched operations
-                    output: CheckpointOutput = self._service_client.checkpoint(
-                        durable_execution_arn=self.durable_execution_arn,
-                        checkpoint_token=current_checkpoint_token,
-                        updates=updates,
-                        client_token=None,
+                    logger.debug(
+                        "Sending %d OperationUpdates out of %d operations, excluding %d empty checkpoints",
+                        len(updates),
+                        len(batch),
+                        empty_count,
                     )
 
-                    logger.debug("Checkpoint batch processed successfully")
+                    try:
+                        # Make API call with batched operations
+                        output: CheckpointOutput = self._service_client.checkpoint(
+                            durable_execution_arn=self.durable_execution_arn,
+                            checkpoint_token=current_checkpoint_token,
+                            updates=updates,
+                            client_token=None,
+                        )
 
-                    # Update local token for next iteration
-                    current_checkpoint_token = output.checkpoint_token
+                        logger.debug("Checkpoint batch processed successfully")
 
-                    # Fetch new operations from the API before unblocking sync waiters
-                    self.fetch_paginated_operations(
-                        output.new_execution_state.operations,
-                        output.checkpoint_token,
-                        output.new_execution_state.next_marker,
-                    )
+                        # Update local token for next iteration
+                        current_checkpoint_token = output.checkpoint_token
 
-                    # Signal completion for any synchronous operations
-                    for queued_op in batch:
-                        if queued_op.completion_event is not None:
-                            queued_op.completion_event.set()
-                except Exception as e:
-                    # Checkpoint failed - wake all blocked threads so they can raise error
-                    # Drain both queues and signal all completion events
-                    logger.exception("Checkpoint batch processing failed")
-                    bg_error: BackgroundThreadError = BackgroundThreadError(
-                        "Checkpoint creation failed", e
-                    )
+                        # Fetch new operations from the API before unblocking sync waiters
+                        self.fetch_paginated_operations(
+                            output.new_execution_state.operations,
+                            output.checkpoint_token,
+                            output.new_execution_state.next_marker,
+                        )
 
-                    # FIFO: although at this point order not really import any anymore
-                    # Signal completion events for the failed batch
-                    for queued_op in batch:
-                        if queued_op.completion_event is not None:
-                            queued_op.completion_event.set(bg_error)
+                        # Signal completion for any synchronous operations
+                        for queued_op in batch:
+                            if queued_op.completion_event is not None:
+                                queued_op.completion_event.set()
+                    except Exception as e:
+                        # Checkpoint failed - wake all blocked threads so they can raise error
+                        # Drain both queues and signal all completion events
+                        logger.exception("Checkpoint batch processing failed")
+                        bg_error: BackgroundThreadError = BackgroundThreadError(
+                            "Checkpoint creation failed", e
+                        )
 
-                    # overflow 1st: although at this point order not really import any anymore
-                    while not self._overflow_queue.empty():
-                        try:
-                            item = self._overflow_queue.get_nowait()
-                            if item.completion_event:
-                                item.completion_event.set(bg_error)
-                        except queue.Empty:
-                            break
+                        # FIFO: although at this point order not really import any anymore
+                        # Signal completion events for the failed batch
+                        for queued_op in batch:
+                            if queued_op.completion_event is not None:
+                                queued_op.completion_event.set(bg_error)
 
-                    # finally Wake all blocked threads in main queue
-                    while not self._checkpoint_queue.empty():
-                        try:
-                            item = self._checkpoint_queue.get_nowait()
-                            if item.completion_event:
-                                item.completion_event.set(bg_error)
-                        except queue.Empty:
-                            break
+                        # overflow 1st: although at this point order not really import any anymore
+                        while not self._overflow_queue.empty():
+                            try:
+                                item = self._overflow_queue.get_nowait()
+                                if item.completion_event:
+                                    item.completion_event.set(bg_error)
+                            except queue.Empty:
+                                break
 
-                    # Set the failure event so future checkpoint attempts fail immediately
-                    self._checkpointing_failed.set(bg_error)
+                        # finally Wake all blocked threads in main queue
+                        while not self._checkpoint_queue.empty():
+                            try:
+                                item = self._checkpoint_queue.get_nowait()
+                                if item.completion_event:
+                                    item.completion_event.set(bg_error)
+                            except queue.Empty:
+                                break
 
-                    # Exit the loop - error has been signaled to main thread via completion events
-                    break
+                        # Set the failure event so future checkpoint attempts fail immediately
+                        self._checkpointing_failed.set(bg_error)
 
-        logger.debug("Background checkpoint processing stopped")
+                        # Exit the loop - error has been signaled to main thread via completion events
+                        break
+
+            logger.debug("Background checkpoint processing stopped")
+        finally:
+            # Record that the background thread is no longer running, regardless
+            # of why it exited (normal stop, a signaled checkpoint error, or an
+            # unexpected exception). A synchronous waiter blocked on a completion
+            # event uses this to detect a thread that died without signaling it,
+            # rather than waiting until the Lambda timeout.
+            self._checkpoint_thread_exited.set()
+
 
     def stop_checkpointing(self) -> None:
         """Signal background thread to stop checkpointing.

@@ -3748,3 +3748,75 @@ def test_initial_execution_state_get_input_payload_none():
 
     result = state.get_input_payload()
     assert result is None
+
+
+def test_create_checkpoint_sync_fails_fast_when_background_thread_exited():
+    """A synchronous checkpoint must not block until the Lambda timeout if the
+    background checkpoint thread has exited without signaling its completion
+    event (a lost-signal wedge). It should raise a retryable InvocationError so
+    the Lambda is retried and the execution replays.
+    """
+    from aws_durable_execution_sdk_python import state as state_module
+    from aws_durable_execution_sdk_python.exceptions import InvocationError
+
+    mock_lambda_client = Mock(spec=LambdaClient)
+    state = ExecutionState(
+        durable_execution_arn="test_arn",
+        initial_checkpoint_token="token123",  # noqa: S106
+        operations={},
+        service_client=mock_lambda_client,
+    )
+
+    # Simulate the wedge: the background thread has exited and will never signal
+    # the waiter's completion event. No processor drains the queue.
+    state._checkpoint_thread_exited.set()
+
+    with patch.object(state_module, "_SYNC_CHECKPOINT_POLL_SECONDS", 0.01):
+        with pytest.raises(InvocationError):
+            state.create_checkpoint(None, is_sync=True)
+
+
+def test_create_checkpoint_sync_surfaces_background_failure_over_exit():
+    """If the background thread recorded a failure, the synchronous waiter must
+    surface that original error (BackgroundThreadError) rather than the generic
+    wedge InvocationError, even when the thread-exited flag is also set.
+    """
+    from aws_durable_execution_sdk_python import state as state_module
+
+    mock_lambda_client = Mock(spec=LambdaClient)
+    state = ExecutionState(
+        durable_execution_arn="test_arn",
+        initial_checkpoint_token="token123",  # noqa: S106
+        operations={},
+        service_client=mock_lambda_client,
+    )
+
+    bg_error = BackgroundThreadError("Checkpoint creation failed", RuntimeError("boom"))
+    state._checkpointing_failed.set(bg_error)
+    state._checkpoint_thread_exited.set()
+
+    with patch.object(state_module, "_SYNC_CHECKPOINT_POLL_SECONDS", 0.01):
+        with pytest.raises(BackgroundThreadError):
+            state.create_checkpoint(None, is_sync=True)
+
+
+def test_checkpoint_batches_forever_sets_exit_flag_on_stop():
+    """The background thread must mark itself exited when it stops normally, so
+    that any later synchronous waiter can detect it is no longer running.
+    """
+    mock_lambda_client = Mock(spec=LambdaClient)
+    state = ExecutionState(
+        durable_execution_arn="test_arn",
+        initial_checkpoint_token="token123",  # noqa: S106
+        operations={},
+        service_client=mock_lambda_client,
+    )
+
+    thread = threading.Thread(target=state.checkpoint_batches_forever, daemon=True)
+    thread.start()
+    state.stop_checkpointing()
+    thread.join(timeout=2.0)
+
+    assert not thread.is_alive()
+    assert state._checkpoint_thread_exited.is_set()
+
