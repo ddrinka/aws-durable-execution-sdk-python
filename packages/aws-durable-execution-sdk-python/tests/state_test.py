@@ -823,6 +823,142 @@ def test_fetch_paginated_operations_logs_error(caplog):
     assert "Durable API error during state fetch." in caplog.text
 
 
+def test_fetch_paginated_operations_detects_marker_cycle(caplog):
+    """A marker returned twice means the listing will never terminate.
+
+    The fetch must fail fast with a retryable InvocationError instead of
+    looping silently until the Lambda timeout, and must keep the operations
+    fetched so far.
+    """
+    from aws_durable_execution_sdk_python.exceptions import InvocationError
+
+    mock_lambda_client = Mock(spec=LambdaClient)
+
+    def mock_get_execution_state(durable_execution_arn, checkpoint_token, next_marker):
+        resp = {
+            "marker1": StateOutput(
+                operations=[
+                    Operation(
+                        operation_id="1",
+                        operation_type=OperationType.STEP,
+                        status=OperationStatus.STARTED,
+                    )
+                ],
+                next_marker="marker2",
+            ),
+            # marker2 points back to marker1: a cycle
+            "marker2": StateOutput(
+                operations=[
+                    Operation(
+                        operation_id="2",
+                        operation_type=OperationType.STEP,
+                        status=OperationStatus.STARTED,
+                    )
+                ],
+                next_marker="marker1",
+            ),
+        }
+        return resp.get(next_marker)
+
+    mock_lambda_client.get_execution_state.side_effect = mock_get_execution_state
+
+    state = ExecutionState(
+        durable_execution_arn="test_arn",
+        initial_checkpoint_token="token123",  # noqa: S106
+        operations={},
+        service_client=mock_lambda_client,
+    )
+
+    with pytest.raises(InvocationError, match="marker cycle"):
+        state.fetch_paginated_operations(
+            initial_operations=[],
+            checkpoint_token="test_token",  # noqa: S106
+            next_marker="marker1",
+        )
+
+    # Only two calls before the cycle is detected
+    assert mock_lambda_client.get_execution_state.call_count == 2
+    # Operations fetched before detection are still stored
+    assert "1" in state.operations
+    assert "2" in state.operations
+    assert "marker cycle" in caplog.text
+
+
+def test_fetch_paginated_operations_enforces_page_cap(caplog):
+    """A listing that never terminates (always-fresh markers) must hit the
+    page cap and fail with a retryable InvocationError."""
+    from aws_durable_execution_sdk_python.exceptions import InvocationError
+
+    mock_lambda_client = Mock(spec=LambdaClient)
+    counter = {"n": 0}
+
+    def mock_get_execution_state(durable_execution_arn, checkpoint_token, next_marker):
+        counter["n"] += 1
+        return StateOutput(
+            operations=[],
+            next_marker=f"marker{counter['n'] + 1}",
+        )
+
+    mock_lambda_client.get_execution_state.side_effect = mock_get_execution_state
+
+    state = ExecutionState(
+        durable_execution_arn="test_arn",
+        initial_checkpoint_token="token123",  # noqa: S106
+        operations={},
+        service_client=mock_lambda_client,
+    )
+
+    with patch("aws_durable_execution_sdk_python.state._STATE_FETCH_MAX_PAGES", 5):
+        with pytest.raises(InvocationError, match="exceeded 5 pages"):
+            state.fetch_paginated_operations(
+                initial_operations=[],
+                checkpoint_token="test_token",  # noqa: S106
+                next_marker="marker1",
+            )
+
+    assert mock_lambda_client.get_execution_state.call_count == 5
+    assert "exceeded 5 pages" in caplog.text
+
+
+def test_fetch_paginated_operations_warns_on_many_pages(caplog):
+    """A slow-but-progressing fetch logs a warning at the configured interval."""
+    import logging as _logging
+
+    mock_lambda_client = Mock(spec=LambdaClient)
+    pages = {
+        f"marker{i}": StateOutput(operations=[], next_marker=f"marker{i + 1}")
+        for i in range(1, 4)
+    }
+    pages["marker4"] = StateOutput(operations=[], next_marker=None)
+
+    def mock_get_execution_state(durable_execution_arn, checkpoint_token, next_marker):
+        return pages[next_marker]
+
+    mock_lambda_client.get_execution_state.side_effect = mock_get_execution_state
+
+    state = ExecutionState(
+        durable_execution_arn="test_arn",
+        initial_checkpoint_token="token123",  # noqa: S106
+        operations={},
+        service_client=mock_lambda_client,
+    )
+
+    with (
+        patch(
+            "aws_durable_execution_sdk_python.state._STATE_FETCH_WARN_EVERY_PAGES", 2
+        ),
+        caplog.at_level(_logging.WARNING),
+    ):
+        state.fetch_paginated_operations(
+            initial_operations=[],
+            checkpoint_token="test_token",  # noqa: S106
+            next_marker="marker1",
+        )
+
+    assert mock_lambda_client.get_execution_state.call_count == 4
+    assert "pagination still running after 2 pages" in caplog.text
+
+
 # ============================================================================
 # Checkpoint Batching Tests
 # ============================================================================

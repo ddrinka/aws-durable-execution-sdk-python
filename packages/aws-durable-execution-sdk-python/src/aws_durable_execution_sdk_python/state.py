@@ -46,6 +46,14 @@ logger = logging.getLogger(__name__)
 # timeout (~15 min).
 _SYNC_CHECKPOINT_POLL_SECONDS: float = 1.0
 
+# Bound the operation-state pagination loop. A well-formed execution needs a
+# handful of pages at most (each page holds up to 1000 operations); hitting
+# this cap means the service is returning markers that never terminate.
+_STATE_FETCH_MAX_PAGES: int = 1000
+# Emit a warning every N pages so a slow-but-progressing fetch is visible in
+# logs before the cap is reached.
+_STATE_FETCH_WARN_EVERY_PAGES: int = 100
+
 
 @dataclass(frozen=True)
 class CheckpointBatcherConfig:
@@ -301,12 +309,48 @@ class ExecutionState:
                 with structured extras before re-raising. Callers are responsible
                 for deciding whether to fail the execution or allow Lambda retry
                 based on is_retryable().
+            InvocationError: If the pagination markers cycle or the page count
+                exceeds the safety cap, indicating the service will never
+                terminate the listing. Raised as a retryable error so the
+                invocation fails fast instead of looping silently until the
+                Lambda timeout.
         """
         all_operations: list[Operation] = (
             initial_operations.copy() if initial_operations else []
         )
+        seen_markers: set[str] = set()
+        pages_fetched = 0
         try:
             while next_marker:
+                if next_marker in seen_markers:
+                    msg = (
+                        "Operation-state pagination marker cycle detected: marker "
+                        "was returned more than once, so the listing will never "
+                        "terminate. Failing the invocation for retry instead of "
+                        f"looping until the Lambda timeout. pages_fetched={pages_fetched} "
+                        f"operations_fetched={len(all_operations)}"
+                    )
+                    logger.error(msg)
+                    raise InvocationError(msg)
+                if pages_fetched >= _STATE_FETCH_MAX_PAGES:
+                    msg = (
+                        "Operation-state pagination exceeded "
+                        f"{_STATE_FETCH_MAX_PAGES} pages without terminating. "
+                        "Failing the invocation for retry instead of looping "
+                        "until the Lambda timeout. "
+                        f"operations_fetched={len(all_operations)}"
+                    )
+                    logger.error(msg)
+                    raise InvocationError(msg)
+                seen_markers.add(next_marker)
+                pages_fetched += 1
+                if pages_fetched % _STATE_FETCH_WARN_EVERY_PAGES == 0:
+                    logger.warning(
+                        "Operation-state pagination still running after %d pages "
+                        "(%d operations fetched so far)",
+                        pages_fetched,
+                        len(all_operations),
+                    )
                 output: StateOutput = self._service_client.get_execution_state(
                     durable_execution_arn=self.durable_execution_arn,
                     checkpoint_token=checkpoint_token,
